@@ -1,0 +1,228 @@
+==============================================
+ISTIO, WITH KUBERNETES GATEWAY API, ON K3D
+==============================================
+
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+
+helm repo update
+
+# The base chart contains the basic CRDs and cluster roles required to set up Istio. This should be installed prior to any other Istio component.
+helm search repo istio/base --versions -l | more
+
+helm install istio-base istio/base \
+--version 1.26.2 \
+-n istio-system \
+--create-namespace \
+--wait
+
+# istiod is the CONTROL PLANE component that manages and configures the proxies to route traffic within the mesh.
+helm search repo istio/istiod --versions -l | more
+
+helm install istiod istio/istiod \
+--version 1.26.2 \
+--namespace istio-system \
+--wait
+
+# The Kubernetes Gateway API CRDs do not come installed by default on most Kubernetes clusters, so make sure they are installed before using the Gateway API.
+kubectl get crd gateways.gateway.networking.k8s.io 
+
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+
+
+# Install MetalLB to create "LoadBalancer" services on K3D. This is required for Kubernetes-Gateway
+helm repo add metallb https://metallb.github.io/metallb
+
+helm install my-metallb metallb/metallb \
+--version 0.15.2 \
+--namespace metallb-system \
+--create-namespace
+
+
+cat <<EOF | kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 172.19.255.200-172.19.255.250
+EOF
+
+
+cat <<EOF | kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default-advertise
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - default-pool
+EOF
+
+
+# DEPLOYING A TEST APPLICATION
+https://istio.io/latest/docs/examples/bookinfo/
+
+kubectl create ns istio-demo
+
+kubectl label namespace istio-demo istio-injection=enabled
+
+Source: https://raw.githubusercontent.com/istio/istio/release-1.26/samples/bookinfo/platform/kube/bookinfo.yaml
+kubectl apply -n istio-demo -f bookinfo.yaml
+
+# Verify that the application is running from within the namespace
+kubectl exec -n istio-demo "$(kubectl get pod -n istio-demo -l app=ratings -o jsonpath='{.items[0].metadata.name}')" -c ratings -- curl -sS productpage:9080/productpage | grep -o "<title>.*</title>"
+
+# Expose the application using Kubernetes Gateway
+Source: https://raw.githubusercontent.com/istio/istio/refs/heads/master/samples/bookinfo/gateway-api/bookinfo-gateway.yaml
+
+k apply -n istio-demo -f bookinfo-gateway.yaml
+
+# Because creating a Kubernetes Gateway resource will also deploy an associated proxy service, run the following command to wait for the gateway to be ready:
+kubectl -n istio-demo get gtw bookinfo-gateway
+
+NAME               CLASS   ADDRESS          PROGRAMMED   AGE
+bookinfo-gateway   istio   172.19.255.201   True         4m10s
+
+# Deploying the Kubernetes Gateway resource will create a service of "LoadBalancer" type (created my MetalLB in our example)
+k get svc -n istio-demo                                                                    15:33
+NAME                     TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)                        AGE
+test-nginx               ClusterIP      10.43.103.162   <none>           80/TCP                         24h
+bookinfo-gateway-istio   LoadBalancer   10.43.180.106   172.19.255.201   15021:30181/TCP,80:31398/TCP   11m
+details                  ClusterIP      10.43.10.166    <none>           9080/TCP                       10m
+ratings                  ClusterIP      10.43.235.136   <none>           9080/TCP                       10m
+reviews                  ClusterIP      10.43.105.134   <none>           9080/TCP                       10m
+productpage              ClusterIP      10.43.230.95    <none>           9080/TCP                       10m
+
+# Create a portforwarf to the bookinfo-gateway-istio LoadBalancer
+k port-forward -n istio-demo svc/bookinfo-gateway-istio 8080:80
+
+
+# Access the application from outside the cluster
+curl http://localhost:8080/productpage -v
+
+Open a browser and access: http://localhost:8080/productpage
+
+
+NOTE-1: Delete and recreate the Pods if you see this error:
+----
+upstream connect error or disconnect/reset before headers. retried and the latest reset reason: 
+remote connection failure, transport failure reason: TLS_error:|268435581:SSL routines:OPENSSL_internal:CERTIFICATE_VERIFY_FAILED:TLS_error_end#
+-----
+
+Note-2: 
+If you see the below error, delete everything and reinstall everything from sctratch
+----
+curl -v http://productpage:9080/productpage
+* Host productpage:9080 was resolved.
+* IPv6: (none)
+* IPv4: 10.43.216.135
+*   Trying 10.43.216.135:9080...
+* Connected to productpage (10.43.216.135) port 9080
+* using HTTP/1.x
+> GET /productpage HTTP/1.1
+> Host: productpage:9080
+> User-Agent: curl/8.14.1
+> Accept: */*
+>
+* Request completely sent off
+< HTTP/1.1 503 Service Unavailable
+< content-length: 95
+< content-type: text/plain
+< date: Sat, 12 Jul 2025 14:22:21 GMT
+< server: envoy
+<
+* Connection #0 to host productpage left intact
+upstream connect error or disconnect/reset before headers. reset reason: connection termination#
+----
+
+
+TESTING ISTIO FEATURES
+-----------------------
+
+# Before you can use Istio to control the Bookinfo version routing, you need to define the available versions.
+Source: https://raw.githubusercontent.com/istio/istio/refs/heads/master/samples/bookinfo/platform/kube/bookinfo-versions.yaml
+k apply -n istio-demo -f bookinfo-versions.yaml
+
+Feature-1: Request Routing
+-----------
+
+About this task:
+The Istio Bookinfo sample consists of four separate microservices, each with multiple versions. 
+Three different versions of one of the microservices, reviews, have been deployed and are running concurrently. 
+To illustrate the problem this causes, access the Bookinfo app’s /productpage in a browser and refresh several times. 
+You’ll notice that sometimes the book review output contains star ratings and other times it does not. 
+This is because without an explicit default service version to route to, Istio routes requests to all available versions in a round robin fashion.
+
+The initial goal of this task is to apply rules that route all traffic to reviews:v1 (version 1) of the microservices. 
+
+Source: https://raw.githubusercontent.com/istio/istio/refs/heads/master/samples/bookinfo/gateway-api/route-reviews-v1.yaml
+
+k apply -n istio-demo -f route-reviews-v1.yaml
+
+The above Httproute tells Istio to forward all traffic destined to the "reviews" service object to the "reviews-v1" service object.
+
+Result:
+You can easily test the new configuration by once again refreshing the /productpage of the Bookinfo app in your browser. 
+Notice that the reviews part of the page displays with no rating stars, no matter how many times you refresh. 
+This is because you configured Istio to route all traffic for the reviews service to the version reviews:v1 and this version 
+of the service does not access the star ratings service.
+
+
+Feature-1a: Request Routing, Route based on user identity (header)
+------------
+
+About this task:
+Next, you will change the route configuration so that all traffic from a specific user is routed to a specific service version. 
+In this case, all traffic from a user named Vijay will be routed to the service reviews:v2.
+This example is enabled by the fact that the productpage service adds a custom end-user header to all outbound HTTP requests to the reviews service.
+
+Remember, reviews:v2 is the version that includes the star ratings feature.
+
+k apply -n istio-demo -f route-reviews-v2.yaml
+
+On the /productpage of the Bookinfo app, log in as user vijay (use a random password).
+
+Refresh the browser. What do you see? The star ratings appear next to each review.
+
+Log in as another user (pick any name you wish).
+
+Refresh the browser. Now the stars are gone. This is because traffic is routed to reviews:v1 for all users except Vijay.
+
+Feature-1 Summary:
+In this task, you used Istio to send 100% of the traffic to the v1 version of each of the Bookinfo services. 
+You then set a rule to selectively send traffic to version v2 of the reviews service based on a custom end-user header
+added to the request by the productpage service.
+
+
+Feature-2: Traffic Shifting
+------------
+
+About this task:
+A common use case is to migrate traffic gradually from an older version of a microservice to a new one. 
+In Istio, you accomplish this goal by configuring a sequence of routing rules that redirect a percentage of traffic 
+from one destination to another.
+
+In this task, you will use send 50% of traffic to reviews:v1 and 50% to reviews:v3. 
+Then, you will complete the migration by sending 100% of traffic to reviews:v3.
+
+k apply -n istio-demo -f route-reviews-50-v3.yaml
+
+Refresh the /productpage in your browser and you now see red colored star ratings approximately 50% of the time. 
+This is because the v3 version of reviews accesses the star ratings service, but the v1 version does not.
+
+Assuming you decide that the reviews:v3 microservice is stable, you can route 100% of the traffic to reviews:v3 by applying this HTTPRoute.
+
+k apply -n istio-demo -f route-reviews-v3.yaml
+
+Refresh the /productpage several times. Now you will always see book reviews with red colored star ratings for each review.
+
+Feature-2: Summary
+In this task you migrated traffic from an old to new version of the reviews service using Istio’s weighted routing feature. 
+Note that this is very different than doing version migration using the deployment features of container orchestration platforms, 
+which use instance scaling to manage the traffic.
+With Istio, you can allow the two versions of the reviews service to scale up and down independently, without affecting the traffic distribution between them.
+
+
